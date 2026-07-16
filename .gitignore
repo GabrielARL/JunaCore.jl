@@ -1,0 +1,5 @@
+Manifest.toml
+ldpc-*.pchk
+ldpc-*.gen
+ldpc.out
+ldpc.err
