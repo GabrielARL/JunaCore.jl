@@ -17,7 +17,8 @@ function _frame_code(m::Modulation, nblocks::Integer)
   blocks > 0 || throw(ArgumentError("frame-wide LDPC needs at least one block"))
   k = blocks * Int(m.ldpc_k)
   n = blocks * Int(m.ldpc_n)
-  method = _code_method(m)
+  method = m.compatibility_profile === _COMPATIBILITY_RPCHAN ?
+    "rpchan" : "frame_sparse"
   seed = _code_seed(m, k, n, m.ldpc_npc)
   if m.code === nothing ||
       m.code.k != k ||
@@ -1229,7 +1230,7 @@ function _frame_receiver_trace(m::Modulation, code::_Code, layout::_Layout,
   throw(ArgumentError("unsupported frame receiver profile: $profile"))
 end
 
-function _demodulate_frame_wide_ldpc(m::Modulation, nbits, x, fc, fs)
+function _prepare_frame_observations(m::Modulation, nbits, x, fc, fs)
   isvalid(m, fc, fs) || throw(ArgumentError("invalid JUNA modulation settings"))
   nbits2 = _positive_nbits(nbits)
   waveform = _complex_waveform(x)
@@ -1257,6 +1258,30 @@ function _demodulate_frame_wide_ldpc(m::Modulation, nbits, x, fc, fs)
     observations[:, :, block] .= _branch_observations(
       m, @view waveform[sample_lo:sample_hi])
   end
+  nbits2, code, layout, nblocks, observations, cfo
+end
+
+function _demodulate_frame_methods(m::Modulation, nbits, x, fc, fs)
+  nbits2, code, layout, nblocks, observations, _ =
+    _prepare_frame_observations(m, nbits, x, fc, fs)
+  standard = _frame_static_trace(
+    m, code, layout, observations, _MODE_STANDARD).best
+  partial = _frame_static_trace(
+    m, code, layout, observations, _MODE_PFFT).best
+  juna = _frame_receiver_trace(m, code, layout, observations).best
+  (
+    standard=_frame_payload_metrics(
+      m, code, standard.lpost_metric, nblocks, nbits2),
+    partial=_frame_payload_metrics(
+      m, code, partial.lpost_metric, nblocks, nbits2),
+    juna=_frame_payload_metrics(
+      m, code, juna.lpost_metric, nblocks, nbits2),
+  )
+end
+
+function _demodulate_frame_wide_ldpc(m::Modulation, nbits, x, fc, fs)
+  nbits2, code, layout, nblocks, observations, cfo =
+    _prepare_frame_observations(m, nbits, x, fc, fs)
   trace = _frame_receiver_trace(m, code, layout, observations)
   _frame_payload_metrics(
     m, code, trace.best.lpost_metric, nblocks, nbits2), cfo

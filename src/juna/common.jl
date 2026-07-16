@@ -136,7 +136,7 @@ struct _Code
   seed::Int
   icols::Vector{Int}
   gen::BitMatrix
-  H::Matrix{Bool}
+  H::BitMatrix
   check_vars::Vector{Vector{Int}}              # check_vars[c] = variable indices in check c
   var_edges::Vector{Vector{Tuple{Int,Int}}}    # var_edges[v] = (check, local-index) edges
   invperm::Vector{Int}                         # undoes the systematic column permutation
@@ -365,6 +365,8 @@ function Modulations.demodulate(m::Modulation, nbits, x, fc, fs)
 end
 
 function demodulate_methods(m::Modulation, nbits, x, fc, fs)
+  receiver_profile(m) === _MODE_FRAME_WIDE_LDPC &&
+    return _demodulate_frame_methods(m, nbits, x, fc, fs)
   nbits, waveform, code, layout, nblocks =
     _prepare_demodulation(m, nbits, x, fc, fs)
   _require_block_samples(m, waveform, nblocks)
@@ -812,7 +814,8 @@ function _create_code(k::Int, n::Int, npc::Int, method::AbstractString,
   0 < k < n || throw(ArgumentError("LDPC dimensions must satisfy 0 < k < n"))
   0 < npc <= n - k ||
     throw(ArgumentError("LDPC column degree must satisfy 0 < npc <= n-k"))
-  method == "rpchan" && return _create_rpchan_code(k, n, npc, seed)
+  method in ("rpchan", "frame_sparse") &&
+    return _create_sparse_systematic_code(k, n, npc, seed, method)
   r = try
     LDPC.build(k, n; method=method, dc=npc, no4cycle=true, seed=seed)
   catch err
@@ -821,18 +824,20 @@ function _create_code(k::Int, n::Int, npc::Int, method::AbstractString,
     throw(ArgumentError("failed to construct LDPC ($k, $n, npc=$npc): $detail"))
   end
   check_vars, var_edges = _build_graph(r.H)
-  _Code(k, n, npc, String(method), seed, r.icols, BitMatrix(r.gen), Matrix{Bool}(r.H),
+  _Code(k, n, npc, String(method), seed, r.icols, BitMatrix(r.gen), BitMatrix(r.H),
         check_vars, var_edges, invperm(r.icols))
 end
 
-function _create_rpchan_code(k::Int, n::Int, dc::Int, seed::Int)
+function _create_sparse_systematic_code(k::Int, n::Int, dc::Int, seed::Int,
+                                        method::AbstractString)
   m = n - k
-  # ReplayCh exports and reports the realized message-column weight. Its
-  # rate-based d_msg -> d_c adjustment has already happened before this public
-  # compatibility value reaches JunaCore.
+  # Identity parity columns make encoding proportional to Tanner-graph edges.
+  # This is the ReplayCh code shape and also keeps large frame-wide codes usable.
   column_degree = min(m, dc)
   rng = MersenneTwister(seed)
   generator = falses(m, k)
+  H = falses(m, n)
+  check_vars = [Int[] for _ in 1:m]
   chosen = Vector{Int}(undef, column_degree)
   @inbounds for column in 1:k
     used = 0
@@ -842,17 +847,19 @@ function _create_rpchan_code(k::Int, n::Int, dc::Int, seed::Int)
       used += 1
       chosen[used] = row
       generator[row, column] = true
+      H[row, column] = true
+      push!(check_vars[row], column)
     end
   end
-  H = falses(m, n)
-  H[:, 1:k] .= generator
   @inbounds for row in 1:m
-    H[row, k + row] = true
+    parity_variable = k + row
+    H[row, parity_variable] = true
+    push!(check_vars[row], parity_variable)
   end
   icols = vcat(collect(m+1:n), collect(1:m))
-  check_vars, var_edges = _build_graph(H)
-  _Code(k, n, dc, "rpchan", seed, icols, generator, H, check_vars, var_edges,
-        invperm(icols))
+  var_edges = _build_var_edges(check_vars, n)
+  _Code(k, n, dc, String(method), seed, icols, generator, H, check_vars,
+        var_edges, invperm(icols))
 end
 
 _ldpc_seed(k, n, npc) = k * 1_000_000 + n * 1_000 + npc
@@ -860,13 +867,17 @@ _ldpc_seed(k, n, npc) = k * 1_000_000 + n * 1_000 + npc
 function _build_graph(H)
   mrows, n = size(H)
   check_vars = [findall(@view H[c, :]) for c in 1:mrows]
+  check_vars, _build_var_edges(check_vars, n)
+end
+
+function _build_var_edges(check_vars, n::Integer)
   var_edges = [Tuple{Int,Int}[] for _ in 1:n]
-  for c in 1:mrows
+  for c in eachindex(check_vars)
     for (a, v) in enumerate(check_vars[c])
       push!(var_edges[v], (c, a))
     end
   end
-  check_vars, var_edges
+  var_edges
 end
 
 # Systematic LDPC encoding: generator rows form the parity prefix while the
@@ -874,6 +885,19 @@ end
 function _encode(code::_Code, bits::AbstractVector{Bool})
   length(bits) == code.k ||
     throw(ArgumentError("LDPC encoder expects $(code.k) bits, got $(length(bits))"))
+  if code.method in ("rpchan", "frame_sparse")
+    # For H=[G I], the transmitted order is [message; parity].
+    codeword = falses(code.n)
+    copyto!(codeword, 1, bits, 1, code.k)
+    @inbounds for check in eachindex(code.check_vars)
+      parity = false
+      for variable in code.check_vars[check]
+        variable <= code.k && (parity ⊻= bits[variable])
+      end
+      codeword[code.k + check] = parity
+    end
+    return codeword
+  end
   nparity = code.n - code.k
   codeword = Vector{Bool}(undef, code.n)
   @inbounds for outpos in 1:code.n
