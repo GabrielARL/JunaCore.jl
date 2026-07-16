@@ -24,6 +24,7 @@ Base.@kwdef mutable struct Modulation <: Modulations.Modulation
   partial_fft_parts::Int = 4
   partial_fft_nbands::Int = 16
   mode::Symbol = :lite               # receiver: :standard, :pfft, :lite, :full, :coupled, or :frame_wide_ldpc; :robust aliases :full
+  frame_receiver::Symbol = :stateful_lite # frame-wide FEC front end/refiner; preserves the original stateful receiver by default
   code::Any = nothing
   layout::Any = nothing
   bp_scratch::Any = nothing
@@ -36,6 +37,9 @@ const _MODE_FULL = :full
 const _MODE_COUPLED = :coupled
 const _MODE_FRAME_WIDE_LDPC = :frame_wide_ldpc
 const _MODE_ROBUST = :robust
+const _FRAME_RECEIVER_PROFILES =
+  (_MODE_STANDARD, _MODE_PFFT, _MODE_LITE, _MODE_FULL, _MODE_COUPLED,
+   :stateful_lite)
 const _RECEIVER_PROFILES =
   (_MODE_STANDARD, _MODE_PFFT, _MODE_LITE, _MODE_FULL, _MODE_COUPLED,
    _MODE_FRAME_WIDE_LDPC)
@@ -70,6 +74,12 @@ CoupledModulation(; kwargs...) =
   Modulation(; (; kwargs..., mode = _MODE_COUPLED)...)
 FrameWideLDPCModulation(; kwargs...) =
   Modulation(; (; kwargs..., mode = _MODE_FRAME_WIDE_LDPC)...)
+
+function _frame_receiver_profile(m::Modulation)
+  receiver_profile(m) === _MODE_FRAME_WIDE_LDPC ||
+    throw(ArgumentError("frame receiver profile only applies to frame-wide LDPC"))
+  m.frame_receiver
+end
 
 # Fixed internal constants — folded out of the user-facing config (they are numerical
 # defaults / solver internals nobody tunes per run). The _GRAD_* knobs only take effect
@@ -227,6 +237,11 @@ function Base.isvalid(m::Modulation, fc, fs)
   profile = receiver_profile(m)
   profile in _RECEIVER_PROFILES || return false
   profile in (_MODE_FULL, _MODE_COUPLED) && _bpc(m) != 2 && return false
+  if profile === _MODE_FRAME_WIDE_LDPC
+    m.frame_receiver in _FRAME_RECEIVER_PROFILES || return false
+    m.frame_receiver in (_MODE_FULL, _MODE_COUPLED) && _bpc(m) != 2 &&
+      return false
+  end
   m.sync_profile in _SYNC_PROFILES || return false
   m.compatibility_profile in _COMPATIBILITY_PROFILES || return false
   m.compatibility_profile === _COMPATIBILITY_RPCHAN &&

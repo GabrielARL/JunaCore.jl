@@ -394,6 +394,20 @@ function _frame_channel_metrics(m::Modulation, layout::_Layout, equalized)
   metrics, pilot_mse
 end
 
+function _frame_pilot_mse(layout::_Layout, equalized)
+  nblocks = size(equalized, 2)
+  total = 0.0
+  count = 0
+  @inbounds for block in 1:nblocks
+    for index in eachindex(layout.pilot_idx)
+      carrier = layout.pilot_idx[index]
+      total += abs2(equalized[carrier, block] - layout.pilot_syms[index])
+      count += 1
+    end
+  end
+  total / max(count, 1)
+end
+
 function _frame_apply_inner_clamps!(m::Modulation, code::_Code, lch)
   spacing = _inner_pilot_spacing(m)
   spacing < 1 && return lch
@@ -480,8 +494,15 @@ function _frame_tie_mse(m::Modulation, layout::_Layout, equalized, lpost_metric)
   total / max(weight_sum, eps(Float64))
 end
 
-function _frame_candidate(m::Modulation, code::_Code, layout::_Layout, equalized)
-  metrics, pilot_mse = _frame_channel_metrics(m, layout, equalized)
+function _frame_candidate(m::Modulation, code::_Code, layout::_Layout,
+                          equalized, metrics=nothing)
+  if metrics === nothing
+    metrics, pilot_mse = _frame_channel_metrics(m, layout, equalized)
+  else
+    length(metrics) == code.n || throw(DimensionMismatch(
+      "frame candidate metrics must match the global LDPC code"))
+    pilot_mse = _frame_pilot_mse(layout, equalized)
+  end
   bp = _frame_bp_decode(m, code, metrics)
   tie_mse = _frame_tie_mse(m, layout, equalized, bp.lpost_metric)
   mean_abs_lpost = mean(abs, bp.lpost_metric)
@@ -496,6 +517,651 @@ function _frame_candidate(m::Modulation, code::_Code, layout::_Layout, equalized
     pilot_mse,
     tie_mse,
     score=pilot_mse + 0.25tie_mse + 0.05syndrome_norm - 1e-4mean_abs_lpost,
+  )
+end
+
+function _frame_independent_equalized(m::Modulation,
+                                      layout::_Layout,
+                                      observations,
+                                      profile::Symbol)
+  profile in (_MODE_STANDARD, _MODE_PFFT) ||
+    throw(ArgumentError("independent frame equalization needs standard or pfft"))
+  nblocks = size(observations, 3)
+  equalized = zeros(ComplexF64, Int(m.nc), nblocks)
+  @inbounds for block in 1:nblocks
+    yparts = @view observations[:, :, block]
+    equalized[:, block] .= if profile === _MODE_STANDARD
+      _residual_pilot_equalize(m, layout, _sum_branches(yparts))
+    else
+      _equalize_from_targets(
+        m, yparts, layout, layout.pilot_idx, layout.pilot_syms)
+    end
+  end
+  equalized
+end
+
+function _frame_static_trace(m::Modulation, code::_Code, layout::_Layout,
+                             observations, profile::Symbol)
+  equalized = _frame_independent_equalized(
+    m, layout, observations, profile)
+  candidate = _frame_candidate(m, code, layout, equalized)
+  (
+    profile=profile,
+    seed=candidate,
+    best=candidate,
+    seed_equalized=equalized,
+    best_equalized=equalized,
+    selected_iteration=0,
+    data_anchor_counts=Int[],
+  )
+end
+
+function _frame_lite_refine(m::Modulation, code::_Code, layout::_Layout,
+                            observations)
+  seed_equalized = _frame_independent_equalized(
+    m, layout, observations, _MODE_PFFT)
+  seed = _frame_candidate(m, code, layout, seed_equalized)
+  seed.valid && return (
+    profile=_MODE_LITE,
+    seed,
+    best=seed,
+    seed_equalized,
+    best_equalized=seed_equalized,
+    selected_iteration=0,
+    data_anchor_counts=Int[],
+  )
+
+  nblocks = size(observations, 3)
+  block_n = Int(m.ldpc_n)
+  current = seed
+  best = seed
+  best_equalized = seed_equalized
+  selected_iteration = 0
+  all_anchor_counts = Int[]
+  for iteration in 1:_JUNA_ITERS
+    equalized = zeros(ComplexF64, Int(m.nc), nblocks)
+    for block in 1:nblocks
+      lo = 1 + (block - 1) * block_n
+      hi = block * block_n
+      anchors = _juna_anchor_targets(
+        m, layout, @view current.lpost_metric[lo:hi])
+      push!(all_anchor_counts, length(anchors.selected))
+      equalized[:, block] .= _equalize_from_targets(
+        m,
+        @view(observations[:, :, block]),
+        layout,
+        anchors.target_idx,
+        anchors.targets;
+        target_weights=anchors.target_weights,
+      )
+    end
+    candidate = _frame_candidate(m, code, layout, equalized)
+    if _juna_better(best, candidate)
+      best = candidate
+      best_equalized = equalized
+      selected_iteration = iteration
+    end
+    step_improves = _juna_better(current, candidate)
+    current = candidate
+    candidate.valid && break
+    step_improves || break
+  end
+  (
+    profile=_MODE_LITE,
+    seed,
+    best,
+    seed_equalized,
+    best_equalized,
+    selected_iteration,
+    data_anchor_counts=all_anchor_counts,
+  )
+end
+
+function _frame_wz_equalized(m::Modulation, layout::_Layout, observations, W)
+  nblocks = size(observations, 3)
+  size(W) == (Int(m.partial_fft_parts), length(layout.bands), nblocks) ||
+    throw(DimensionMismatch("frame Wz combiner shape does not match observations"))
+  equalized = zeros(ComplexF64, Int(m.nc), nblocks)
+  @inbounds for block in 1:nblocks
+    for (band_id, band) in enumerate(layout.bands)
+      for carrier in band
+        acc = 0.0 + 0.0im
+        for part in 1:Int(m.partial_fft_parts)
+          acc += conj(W[part, band_id, block]) *
+                 observations[part, carrier, block]
+        end
+        equalized[carrier, block] = acc
+      end
+    end
+  end
+  equalized
+end
+
+function _frame_wz_candidate(m::Modulation, code::_Code, layout::_Layout,
+                             observations, W, z)
+  equalized = _frame_wz_equalized(m, layout, observations, W)
+  metrics = clamp.(-z, -_LLR_CLIP, _LLR_CLIP)
+  _frame_candidate(m, code, layout, equalized, metrics)
+end
+
+function _frame_wz_loss_and_grad!(m::Modulation,
+                                  code::_Code,
+                                  layout::_Layout,
+                                  gW,
+                                  gz,
+                                  W,
+                                  z,
+                                  W0,
+                                  z0,
+                                  observations,
+                                  confidence,
+                                  scratch)
+  _bpc(m) == 2 || throw(ArgumentError(
+    "frame JUNA-Wz implements QPSK only"))
+  nblocks = size(observations, 3)
+  expected_W = (
+    Int(m.partial_fft_parts), length(layout.bands), nblocks)
+  size(W) == expected_W || throw(DimensionMismatch(
+    "frame Wz state must have shape $expected_W"))
+  size(gW) == expected_W || throw(DimensionMismatch(
+    "frame Wz gradient must have shape $expected_W"))
+  length(z) == code.n == length(gz) ||
+    throw(DimensionMismatch("frame Wz logits must match the global code"))
+
+  fill!(gW, 0.0 + 0.0im)
+  fill!(gz, 0.0)
+  fill!(scratch.gS, 0.0 + 0.0im)
+  fill!(scratch.gradx, 0.0)
+  _gradient_symbol_grid!(m, scratch.S, scratch.xbit, z)
+
+  block_n = Int(m.ldpc_n)
+  tones_per_block = cld(block_n, 2)
+  total_tones = nblocks * tones_per_block
+  length(scratch.S) == total_tones ||
+    throw(DimensionMismatch("frame Wz symbol grid does not match its blocks"))
+  length(confidence) == total_tones ||
+    throw(DimensionMismatch("frame Wz confidence does not match its symbols"))
+
+  loss = 0.0
+  tie_scale = _GRAD_TIE_WEIGHT / max(total_tones, 1)
+  @inbounds for block in 1:nblocks
+    tone_offset = (block - 1) * tones_per_block
+    for tone in 1:tones_per_block
+      carrier = layout.data_idx[tone]
+      band_id = layout.band_ids[carrier]
+      symbol_index = tone_offset + tone
+      combined = 0.0 + 0.0im
+      for part in 1:Int(m.partial_fft_parts)
+        combined += conj(W[part, band_id, block]) *
+                    observations[part, carrier, block]
+      end
+      local_scale = tie_scale * confidence[symbol_index]
+      local_scale <= 0.0 && continue
+      residual = combined - scratch.S[symbol_index]
+      loss += local_scale * abs2(residual)
+      for part in 1:Int(m.partial_fft_parts)
+        gW[part, band_id, block] +=
+          local_scale * observations[part, carrier, block] * conj(residual)
+      end
+      scratch.gS[symbol_index] -= local_scale * residual
+    end
+  end
+
+  pilot_count = nblocks * length(layout.pilot_idx)
+  pilot_scale = _GRAD_PILOT_WEIGHT / max(pilot_count, 1)
+  @inbounds for block in 1:nblocks
+    for (pilot_position, carrier) in enumerate(layout.pilot_idx)
+      band_id = layout.band_ids[carrier]
+      combined = 0.0 + 0.0im
+      for part in 1:Int(m.partial_fft_parts)
+        combined += conj(W[part, band_id, block]) *
+                    observations[part, carrier, block]
+      end
+      residual = combined - layout.pilot_syms[pilot_position]
+      loss += pilot_scale * abs2(residual)
+      for part in 1:Int(m.partial_fft_parts)
+        gW[part, band_id, block] +=
+          pilot_scale * observations[part, carrier, block] * conj(residual)
+      end
+    end
+  end
+
+  invsqrt2 = inv(sqrt(2.0))
+  @inbounds for tone in eachindex(scratch.S)
+    bit_i = 2tone - 1
+    bit_q = bit_i + 1
+    relaxed_i = scratch.xbit[bit_i]
+    gz[bit_i] += 2.0 * real(scratch.gS[tone]) *
+                 (0.5 * (1.0 - relaxed_i * relaxed_i) * invsqrt2)
+    if bit_q <= length(z)
+      relaxed_q = scratch.xbit[bit_q]
+      gz[bit_q] += 2.0 * imag(scratch.gS[tone]) *
+                   (0.5 * (1.0 - relaxed_q * relaxed_q) * invsqrt2)
+    end
+  end
+
+  if _GRAD_LAMBDA_CODE > 0.0 && !isempty(code.check_vars)
+    lambda = _GRAD_LAMBDA_CODE / length(code.check_vars)
+    loss += _parity_penalty_and_gradx!(
+      scratch.gradx,
+      scratch.xbit,
+      code.check_vars,
+      lambda,
+      scratch.prefix,
+      scratch.clamped,
+    )
+    @inbounds for bit in eachindex(z)
+      derivative = 0.5 * (1.0 - scratch.xbit[bit] * scratch.xbit[bit])
+      gz[bit] += scratch.gradx[bit] * derivative
+    end
+  end
+
+  if _GRAD_ETA_W > 0.0
+    scale = _GRAD_ETA_W / max(length(W), 1)
+    @inbounds for index in eachindex(W)
+      difference = W[index] - W0[index]
+      loss += scale * abs2(difference)
+      gW[index] += scale * difference
+    end
+  end
+  if _GRAD_GAMMA_Z > 0.0
+    scale = _GRAD_GAMMA_Z / max(length(z), 1)
+    @inbounds for index in eachindex(z)
+      loss += scale * z[index] * z[index]
+      gz[index] += 2.0 * scale * z[index]
+    end
+  end
+  if _GRAD_TRUST_MU > 0.0
+    scale = _GRAD_TRUST_MU / max(length(z), 1)
+    @inbounds for index in eachindex(z)
+      difference = z[index] - z0[index]
+      loss += 0.5 * scale * difference * difference
+      gz[index] += scale * difference
+    end
+  end
+  loss
+end
+
+function _frame_wz_refine(m::Modulation, code::_Code, layout::_Layout,
+                          observations)
+  nblocks = size(observations, 3)
+  seed_equalized = _frame_independent_equalized(
+    m, layout, observations, _MODE_PFFT)
+  seed = _frame_candidate(m, code, layout, seed_equalized)
+
+  W = Array{ComplexF64}(undef,
+    Int(m.partial_fft_parts), length(layout.bands), nblocks)
+  @inbounds for block in 1:nblocks
+    W[:, :, block] .= _initial_gradient_W(
+      m, @view(observations[:, :, block]), layout)
+  end
+  W0 = copy(W)
+  z = clamp.(-Float64.(seed.lpost_metric), -_GRAD_CLIP_Z, _GRAD_CLIP_Z)
+  z0 = copy(z)
+  confidence = _posterior_confidence(m, z0)
+
+  gW = similar(W)
+  gz = zeros(Float64, length(z))
+  mW = zero(W)
+  mz = zeros(Float64, length(z))
+  vW = zeros(Float64, size(W))
+  vz = zeros(Float64, length(z))
+  scratch = _GradientScratch(m, code)
+
+  best = seed
+  best_equalized = seed_equalized
+  selected_iteration = 0
+  best_loss = _frame_wz_loss_and_grad!(
+    m, code, layout, gW, gz, W, z, W0, z0,
+    observations, confidence, scratch)
+  best_W = copy(W)
+  best_z = copy(z)
+
+  for iteration in 1:max(_GRAD_STEPS, 0)
+    _adam_step_complex!(
+      W, mW, vW, gW, iteration, _GRAD_ALPHA_W,
+      _GRAD_BETA1, _GRAD_BETA2, _GRAD_EPS_ADAM,
+      _GRAD_CLIP, _GRAD_CLIP_W)
+    _adam_step_real!(
+      z, mz, vz, gz, iteration, _GRAD_ALPHA_Z,
+      _GRAD_BETA1, _GRAD_BETA2, _GRAD_EPS_ADAM,
+      _GRAD_CLIP, _GRAD_CLIP_Z)
+    loss = _frame_wz_loss_and_grad!(
+      m, code, layout, gW, gz, W, z, W0, z0,
+      observations, confidence, scratch)
+    if isfinite(loss) && loss < best_loss
+      best_loss = loss
+      copyto!(best_W, W)
+      copyto!(best_z, z)
+    end
+    candidate = _frame_wz_candidate(
+      m, code, layout, observations, W, z)
+    if _juna_better(best, candidate)
+      best = candidate
+      best_equalized = _frame_wz_equalized(
+        m, layout, observations, W)
+      selected_iteration = iteration
+    end
+  end
+
+  candidate = _frame_wz_candidate(
+    m, code, layout, observations, best_W, best_z)
+  if _juna_better(best, candidate)
+    best = candidate
+    best_equalized = _frame_wz_equalized(
+      m, layout, observations, best_W)
+  end
+  (
+    profile=_MODE_FULL,
+    seed,
+    best,
+    seed_equalized,
+    best_equalized,
+    selected_iteration,
+    data_anchor_counts=Int[],
+  )
+end
+
+function _frame_global_inner_pairs(m::Modulation, code::_Code)
+  pairs = Tuple{Int,Bool}[]
+  spacing = _inner_pilot_spacing(m)
+  spacing < 1 && return pairs
+  parity = code.n - code.k
+  @inbounds for message_position in 1:code.k
+    (message_position - 1) % spacing == 0 || continue
+    push!(pairs, (
+      code.invperm[parity + message_position],
+      _frame_inner_bit(m, message_position),
+    ))
+  end
+  sort!(pairs; by=first)
+  pairs
+end
+
+function _frame_coupled_problem(m::Modulation,
+                                code::_Code,
+                                layout::_Layout,
+                                observations,
+                                block::Int,
+                                inner_pairs)
+  block_n = Int(m.ldpc_n)
+  lo = 1 + (block - 1) * block_n
+  hi = block * block_n
+  local_pairs = [
+    (position - lo + 1, bit)
+    for (position, bit) in inner_pairs
+    if lo <= position <= hi
+  ]
+  _CoupledProblem(
+    @view(observations[:, :, block]);
+    active=layout.active,
+    dc_index=1,
+    pilot_idx=layout.pilot_idx,
+    pilot_syms=layout.pilot_syms,
+    data_idx=layout.data_idx,
+    bands=layout.bands,
+    nbits=block_n,
+    inner_pilot_idx=first.(local_pairs),
+    inner_pilot_bits=last.(local_pairs),
+    parity_sets=Vector{Vector{Int}}(),
+  )
+end
+
+function _frame_initial_coupled_state(m::Modulation,
+                                      layout::_Layout,
+                                      problem,
+                                      seed_metrics)
+  length(seed_metrics) == problem.nbits || throw(DimensionMismatch(
+    "frame WCz seed slice must match one OFDM block"))
+  W = _initial_gradient_W(m, problem.observations, layout)
+  z = clamp.(-Float64.(seed_metrics), -_GRAD_CLIP_Z, _GRAD_CLIP_Z)
+  @inbounds for bit in eachindex(z)
+    problem.inner_pilot_mask[bit] || continue
+    z[bit] = problem.inner_pilot_bits[bit] ?
+             -_GRAD_CLIP_Z : _GRAD_CLIP_Z
+  end
+  state = _CoupledState(problem; W=W, z=z)
+  scratch = _CoupledScratch(problem)
+  _coupled_symbols!(problem, state, scratch)
+  _profile_initial_coupled_C!(state.C, problem, scratch.symbols)
+  state
+end
+
+function _frame_coupled_equalized(m::Modulation,
+                                  layout::_Layout,
+                                  problems,
+                                  states)
+  nblocks = length(problems)
+  length(states) == nblocks || throw(DimensionMismatch(
+    "frame WCz state count must match its block count"))
+  equalized = zeros(ComplexF64, Int(m.nc), nblocks)
+  @inbounds for block in 1:nblocks
+    problem = problems[block]
+    state = states[block]
+    for carrier in problem.active
+      group = _coupled_combiner_group(problem, carrier)
+      for branch in axes(problem.observations, 1)
+        equalized[carrier, block] +=
+          conj(state.W[branch, group]) *
+          problem.observations[branch, carrier]
+      end
+    end
+  end
+  equalized
+end
+
+function _frame_wcz_candidate(m::Modulation,
+                              code::_Code,
+                              layout::_Layout,
+                              problems,
+                              states,
+                              z)
+  equalized = _frame_coupled_equalized(
+    m, layout, problems, states)
+  metrics = clamp.(-z, -_LLR_CLIP, _LLR_CLIP)
+  _frame_candidate(m, code, layout, equalized, metrics)
+end
+
+function _frame_coupled_loss_and_grad!(m::Modulation,
+                                       code::_Code,
+                                       problems,
+                                       states,
+                                       gradients,
+                                       scratches,
+                                       gz,
+                                       z,
+                                       inner_mask,
+                                       inner_bits,
+                                       parity_relaxed,
+                                       parity_grad,
+                                       parity_prefix,
+                                       parity_clamped;
+                                       weights=_COUPLED_RUNTIME_WEIGHTS)
+  nblocks = length(problems)
+  length(states) == nblocks == length(gradients) == length(scratches) ||
+    throw(DimensionMismatch("frame WCz workspaces must share one block count"))
+  length(z) == code.n == length(gz) ||
+    throw(DimensionMismatch("frame WCz logits must match the global code"))
+  block_n = Int(m.ldpc_n)
+  fill!(gz, 0.0)
+
+  local_weights = _CoupledWeights(
+    observation=weights.observation,
+    pilot=weights.pilot,
+    tie=weights.tie,
+    response_regularization=weights.response_regularization,
+    combiner_regularization=weights.combiner_regularization,
+    smoothness=weights.smoothness,
+    parity=0.0,
+  )
+  inverse_blocks = inv(Float64(nblocks))
+  loss = 0.0
+  @inbounds for block in 1:nblocks
+    lo = 1 + (block - 1) * block_n
+    hi = block * block_n
+    copyto!(states[block].z, @view z[lo:hi])
+    terms = _coupled_objective_and_gradient!(
+      gradients[block],
+      problems[block],
+      states[block];
+      weights=local_weights,
+      scratch=scratches[block],
+    )
+    loss += inverse_blocks * terms.total
+    gradients[block].W .*= inverse_blocks
+    gradients[block].C .*= inverse_blocks
+    @views gz[lo:hi] .= inverse_blocks .* gradients[block].z
+  end
+
+  fill!(parity_grad, 0.0)
+  @inbounds for bit in eachindex(z)
+    parity_relaxed[bit] = inner_mask[bit] ?
+      _pm(inner_bits[bit]) : tanh(0.5 * z[bit])
+  end
+  if weights.parity > 0.0 && !isempty(code.check_vars)
+    parity_weight = weights.parity / length(code.check_vars)
+    loss += _parity_penalty_and_gradx!(
+      parity_grad,
+      parity_relaxed,
+      code.check_vars,
+      parity_weight,
+      parity_prefix,
+      parity_clamped,
+    )
+    @inbounds for bit in eachindex(z)
+      inner_mask[bit] && continue
+      derivative = 0.5 *
+        (1.0 - parity_relaxed[bit] * parity_relaxed[bit])
+      gz[bit] += parity_grad[bit] * derivative
+    end
+  end
+  loss
+end
+
+function _frame_wcz_refine(m::Modulation, code::_Code, layout::_Layout,
+                           observations)
+  _bpc(m) == 2 || throw(ArgumentError(
+    "frame JUNA-WCz implements QPSK only"))
+  nblocks = size(observations, 3)
+  block_n = Int(m.ldpc_n)
+  seed_equalized = _frame_independent_equalized(
+    m, layout, observations, _MODE_PFFT)
+  seed = _frame_candidate(m, code, layout, seed_equalized)
+
+  inner_pairs = _frame_global_inner_pairs(m, code)
+  inner_mask = falses(code.n)
+  inner_bits = falses(code.n)
+  @inbounds for (position, bit) in inner_pairs
+    inner_mask[position] = true
+    inner_bits[position] = bit
+  end
+  problems = [
+    _frame_coupled_problem(
+      m, code, layout, observations, block, inner_pairs)
+    for block in 1:nblocks
+  ]
+  states = [
+    _frame_initial_coupled_state(
+      m,
+      layout,
+      problems[block],
+      @view(seed.lpost_metric[
+        1 + (block - 1) * block_n:block * block_n]),
+    )
+    for block in 1:nblocks
+  ]
+  gradients = [_CoupledGradient(problem) for problem in problems]
+  scratches = [_CoupledScratch(problem) for problem in problems]
+
+  z = clamp.(-Float64.(seed.lpost_metric),
+             -_GRAD_CLIP_Z, _GRAD_CLIP_Z)
+  @inbounds for bit in eachindex(z)
+    inner_mask[bit] || continue
+    z[bit] = inner_bits[bit] ? -_GRAD_CLIP_Z : _GRAD_CLIP_Z
+  end
+  gz = zeros(Float64, length(z))
+  mz = zeros(Float64, length(z))
+  vz = zeros(Float64, length(z))
+  mW = [zero(state.W) for state in states]
+  vW = [zeros(Float64, size(state.W)) for state in states]
+  mC = [zero(state.C) for state in states]
+  vC = [zeros(Float64, size(state.C)) for state in states]
+  parity_relaxed = zeros(Float64, code.n)
+  parity_grad = zeros(Float64, code.n)
+  max_degree = maximum((length(check) for check in code.check_vars); init=0)
+  parity_prefix = zeros(Float64, max_degree)
+  parity_clamped = zeros(Float64, max_degree)
+
+  _frame_coupled_loss_and_grad!(
+    m, code, problems, states, gradients, scratches,
+    gz, z, inner_mask, inner_bits, parity_relaxed, parity_grad,
+    parity_prefix, parity_clamped)
+  best = seed
+  best_equalized = seed_equalized
+  selected_iteration = 0
+
+  config = _COUPLED_PUBLIC_CONFIG
+  for iteration in 1:config.steps
+    @inbounds for block in 1:nblocks
+      _adam_step_complex!(
+        states[block].W,
+        mW[block],
+        vW[block],
+        gradients[block].W,
+        iteration,
+        config.alpha_W,
+        config.beta1,
+        config.beta2,
+        config.epsilon,
+        config.gradient_clip,
+        config.complex_value_clip,
+      )
+      _adam_step_complex!(
+        states[block].C,
+        mC[block],
+        vC[block],
+        gradients[block].C,
+        iteration,
+        config.alpha_C,
+        config.beta1,
+        config.beta2,
+        config.epsilon,
+        config.gradient_clip,
+        config.complex_value_clip,
+      )
+    end
+    _adam_step_real!(
+      z, mz, vz, gz, iteration,
+      config.alpha_z, config.beta1, config.beta2, config.epsilon,
+      config.gradient_clip, config.logit_clip)
+    @inbounds for bit in eachindex(z)
+      inner_mask[bit] || continue
+      z[bit] = inner_bits[bit] ? -config.logit_clip : config.logit_clip
+    end
+
+    loss = _frame_coupled_loss_and_grad!(
+      m, code, problems, states, gradients, scratches,
+      gz, z, inner_mask, inner_bits, parity_relaxed, parity_grad,
+      parity_prefix, parity_clamped)
+    isfinite(loss) || break
+    candidate = _frame_wcz_candidate(
+      m, code, layout, problems, states, z)
+    if _juna_better(best, candidate)
+      best = candidate
+      best_equalized = _frame_coupled_equalized(
+        m, layout, problems, states)
+      selected_iteration = iteration
+    end
+  end
+
+  (
+    profile=_MODE_COUPLED,
+    seed,
+    best,
+    seed_equalized,
+    best_equalized,
+    selected_iteration,
+    data_anchor_counts=Int[],
   )
 end
 
@@ -542,6 +1208,27 @@ function _frame_juna_refine(m::Modulation, code::_Code, layout::_Layout,
   )
 end
 
+function _frame_receiver_trace(m::Modulation, code::_Code, layout::_Layout,
+                               observations)
+  profile = _frame_receiver_profile(m)
+  profile === _MODE_STANDARD &&
+    return _frame_static_trace(
+      m, code, layout, observations, _MODE_STANDARD)
+  profile === _MODE_PFFT &&
+    return _frame_static_trace(
+      m, code, layout, observations, _MODE_PFFT)
+  profile === _MODE_LITE &&
+    return _frame_lite_refine(m, code, layout, observations)
+  profile === _MODE_FULL &&
+    return _frame_wz_refine(m, code, layout, observations)
+  profile === _MODE_COUPLED &&
+    return _frame_wcz_refine(m, code, layout, observations)
+  profile === :stateful_lite &&
+    return merge((profile=:stateful_lite,),
+                 _frame_juna_refine(m, code, layout, observations))
+  throw(ArgumentError("unsupported frame receiver profile: $profile"))
+end
+
 function _demodulate_frame_wide_ldpc(m::Modulation, nbits, x, fc, fs)
   isvalid(m, fc, fs) || throw(ArgumentError("invalid JUNA modulation settings"))
   nbits2 = _positive_nbits(nbits)
@@ -570,7 +1257,7 @@ function _demodulate_frame_wide_ldpc(m::Modulation, nbits, x, fc, fs)
     observations[:, :, block] .= _branch_observations(
       m, @view waveform[sample_lo:sample_hi])
   end
-  trace = _frame_juna_refine(m, code, layout, observations)
+  trace = _frame_receiver_trace(m, code, layout, observations)
   _frame_payload_metrics(
     m, code, trace.best.lpost_metric, nblocks, nbits2), cfo
 end
