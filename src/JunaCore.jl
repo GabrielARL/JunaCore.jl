@@ -44,4 +44,11 @@ module JunaFrameWideLDPC
   const Modulation = getfield(parentmodule(@__MODULE__), :Juna).FrameWideLDPCModulation
 end
 
+module JunaFrameRLS
+  # Rpchan-compatible frame construction/acquisition with the paper receiver's
+  # stateful band-RLS and frame-wide LDPC refinement path.
+  export Modulation
+  const Modulation = getfield(parentmodule(@__MODULE__), :Juna).FrameRLSModulation
+end
+
 end # module JunaCore

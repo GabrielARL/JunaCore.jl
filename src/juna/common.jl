@@ -4,8 +4,8 @@
 Base.@kwdef mutable struct Modulation <: Modulations.Modulation
   nc::UInt16 = 1024
   np::UInt16 = 256
-  bw::Float64 = 1.0
-  dc0::Int16 = 0
+  bw::Float64 = 1.0                    # occupied bandwidth as a fraction of fs
+  dc0::Int16 = 0                       # occupied-band centre offset from fc, in kHz
   bpc::Int = 2                       # bits per data carrier: 1=BPSK, 2=QPSK
   pilot_ratio::Float64 = 1/3         # outer comb-pilot density (fraction of active tones); snapped to the nearest 1/k spacing
   inner_pilot_ratio::Float64 = 1/2   # inner-pilot density among message bits (0 = off); snapped to the nearest 1/k spacing
@@ -23,7 +23,7 @@ Base.@kwdef mutable struct Modulation <: Modulations.Modulation
   ldpc_seed::Int = 51_001            # frame/code seed used by the Rpchan-compatible systematic code
   partial_fft_parts::Int = 4
   partial_fft_nbands::Int = 16
-  mode::Symbol = :lite               # receiver: :standard, :pfft, :lite, :full, :coupled, or :frame_wide_ldpc; :robust aliases :full
+  mode::Symbol = :lite               # receiver: canonical modes plus :frame_rls and the legacy :robust alias
   frame_receiver::Symbol = :stateful_lite # frame-wide FEC front end/refiner; preserves the original stateful receiver by default
   code::Any = nothing
   layout::Any = nothing
@@ -36,6 +36,7 @@ const _MODE_LITE = :lite
 const _MODE_FULL = :full
 const _MODE_COUPLED = :coupled
 const _MODE_FRAME_WIDE_LDPC = :frame_wide_ldpc
+const _MODE_FRAME_RLS = :frame_rls
 const _MODE_ROBUST = :robust
 const _FRAME_RECEIVER_PROFILES =
   (_MODE_STANDARD, _MODE_PFFT, _MODE_LITE, _MODE_FULL, _MODE_COUPLED,
@@ -43,12 +44,17 @@ const _FRAME_RECEIVER_PROFILES =
 const _RECEIVER_PROFILES =
   (_MODE_STANDARD, _MODE_PFFT, _MODE_LITE, _MODE_FULL, _MODE_COUPLED,
    _MODE_FRAME_WIDE_LDPC)
+const _PUBLIC_RECEIVER_MODES =
+  (_MODE_STANDARD, _MODE_PFFT, _MODE_LITE, _MODE_FULL, _MODE_COUPLED,
+   _MODE_FRAME_WIDE_LDPC, _MODE_FRAME_RLS)
 
 receiver_profile(mode::Symbol) =
-  mode === _MODE_ROBUST ? _MODE_FULL : mode
+  mode === _MODE_ROBUST ? _MODE_FULL :
+  mode === _MODE_FRAME_RLS ? _MODE_FRAME_WIDE_LDPC : mode
 receiver_profile(m::Modulation) = receiver_profile(m.mode)
 
 function Modulations.refinement_objective(m::Modulation)
+  m.mode === _MODE_FRAME_RLS && return :frame_stateful_band_rls
   profile = receiver_profile(m)
   # The paper's benchmark baselines: :standard optimizes nothing (one-tap
   # interpolated equalization, declared :none), while :pfft's only objective
@@ -74,6 +80,37 @@ CoupledModulation(; kwargs...) =
   Modulation(; (; kwargs..., mode = _MODE_COUPLED)...)
 FrameWideLDPCModulation(; kwargs...) =
   Modulation(; (; kwargs..., mode = _MODE_FRAME_WIDE_LDPC)...)
+
+function FrameRLSModulation(; kwargs...)
+  identity = (
+    mode=_MODE_FRAME_RLS,
+    frame_receiver=:stateful_lite,
+    sync=true,
+    sync_profile=_SYNC_PROFILE_RPCHAN,
+    compatibility_profile=_COMPATIBILITY_RPCHAN,
+  )
+  supplied = (; kwargs...)
+  for (field, expected) in pairs(identity)
+    haskey(supplied, field) || continue
+    supplied[field] == expected || throw(ArgumentError(
+      "FrameRLSModulation fixes $field=$expected"))
+  end
+  defaults = (
+    nc=1024,
+    np=16,
+    bpc=2,
+    pilot_ratio=1 / 5,
+    inner_pilot_ratio=1 / 10,
+    rpchan_preamble_seed=61_001,
+    ldpc_k=817,
+    ldpc_n=1634,
+    ldpc_npc=10,
+    ldpc_seed=51_001,
+    partial_fft_parts=4,
+    partial_fft_nbands=4,
+  )
+  Modulation(; merge(defaults, supplied, identity)...)
+end
 
 function _frame_receiver_profile(m::Modulation)
   receiver_profile(m) === _MODE_FRAME_WIDE_LDPC ||
@@ -164,20 +201,28 @@ end
 
 function Modulations.init(m::Modulation, fc, fs)
   _ = (fc, fs)
+  frame_rls = m.mode === _MODE_FRAME_RLS
   m.nc = 1024
-  m.np = 256
+  m.np = frame_rls ? 16 : 256
   m.bw = 1.0
   m.dc0 = 0
   m.bpc = 2
-  m.pilot_ratio = 1/3
-  m.inner_pilot_ratio = 1/2
-  m.ldpc_k = 340
-  m.ldpc_n = 1360
-  m.ldpc_npc = 3
+  m.pilot_ratio = frame_rls ? 1/5 : 1/3
+  m.inner_pilot_ratio = frame_rls ? 1/10 : 1/2
+  m.ldpc_k = frame_rls ? 817 : 340
+  m.ldpc_n = frame_rls ? 1634 : 1360
+  m.ldpc_npc = frame_rls ? 10 : 3
   m.partial_fft_parts = 4
-  m.partial_fft_nbands = _PARTIAL_FFT_NBANDS
+  m.partial_fft_nbands = frame_rls ? 4 : _PARTIAL_FFT_NBANDS
   # m.mode is left untouched so Modulation(mode=:robust) survives init()
-  # Acquisition choices are left untouched so constructor-selected profiles survive init().
+  # JUNA-FrameRLS is an identity-bearing public preset; init restores it.
+  if frame_rls
+    m.frame_receiver = :stateful_lite
+    m.sync = true
+    m.sync_profile = _SYNC_PROFILE_RPCHAN
+    m.compatibility_profile = _COMPATIBILITY_RPCHAN
+  end
+  # Other acquisition choices remain untouched so constructor-selected profiles survive init().
   m.code = nothing
   m.layout = nothing
   m.bp_scratch = nothing
@@ -185,6 +230,7 @@ function Modulations.init(m::Modulation, fc, fs)
 end
 
 _bpc(m::Modulation) = Int(m.bpc)
+_dc0_hz(m::Modulation) = 1_000.0 * Int(m.dc0)
 _pm(b::Bool) = b ? -1.0 : 1.0    # bipolar map 1-2b: bit 0 -> +1, bit 1 -> -1
 
 # Snap a pilot DENSITY ratio (fraction of positions that are pilots, e.g. 0.3) to the nearest
@@ -261,7 +307,7 @@ function Base.isvalid(m::Modulation, fc, fs)
   _pilot_training_sufficient(m, layout) || return false
   if m.dc0 != 0                               # shifted occupied band must still fit within Nyquist
     nactive = clamp(floor(Int, (N - 1) * m.bw), 2, N - 1)
-    (nactive ÷ 2) + abs(round(Int, Float64(m.dc0) / fs * N)) <= N ÷ 2 - 1 || return false
+    (nactive ÷ 2) + abs(round(Int, _dc0_hz(m) / fs * N)) <= N ÷ 2 - 1 || return false
   end
   true
 end
@@ -284,10 +330,12 @@ end
 # 6. Optional LFM sync wrapping produces [sync][blocks...][sync].
 #    The Rpchan profile instead produces [preamble][guard][blocks...].
 #
-# How fc and fs affect modulation: `fc` is currently transmit metadata.
-# `fs` sets the Hz-to-bin conversion when
-# dc0 shifts the occupied band and sets the optional LFM waveform's time scale.
-# With dc0=0 and sync=false, neither changes the generated sample values.
+# How fc, fs, bw, and dc0 affect modulation: `fc` is the RF centre metadata for
+# this complex-baseband waveform. `bw * fs` is the occupied RF bandwidth, and
+# integer `dc0` shifts its centre away from `fc` in kHz. Thus fc=fs=24 kHz,
+# bw=0.5, dc0=1 occupies approximately 19--31 kHz after upconversion. `fs` also
+# sets the optional LFM waveform's time scale. With dc0=0 and sync=false, fc
+# does not change the generated complex-baseband samples.
 function Modulations.modulate(m::Modulation, bits, fc, fs)
   isvalid(m, fc, fs) || throw(ArgumentError("invalid JUNA modulation settings"))
   payload = Bool.(bits)
@@ -732,7 +780,7 @@ function _layout(m::Modulation, fs)
          Int(m.dc0), Float64(fs), m.compatibility_profile)
   m.layout isa _Layout && m.layout.signature == sig && return m.layout::_Layout
 
-  N, bw, pilot_spacing, nbands, dc0_hz, fsr, compatibility = sig
+  N, bw, pilot_spacing, nbands, dc0_khz, fsr, compatibility = sig
   active = if compatibility === _COMPATIBILITY_RPCHAN
     half = N ÷ 2
     [mod(k, N) + 1 for k in vcat(collect((-half + 1):-1), collect(1:(half - 1)))]
@@ -741,8 +789,8 @@ function _layout(m::Modulation, fs)
     npos = nactive ÷ 2
     nneg = nactive - npos
     bins = vcat(collect(2:1+npos), collect(N-nneg+1:N))        # nactive carriers centred on DC
-    if dc0_hz != 0                                             # dc0: shift the occupied band's centre by dc0 Hz
-      shift = round(Int, dc0_hz / fsr * N)                     # baseband Hz → subcarrier bins
+    if dc0_khz != 0                                            # occupied-band centre offset from fc, in kHz
+      shift = round(Int, (1_000.0 * dc0_khz) / fsr * N)        # baseband Hz → subcarrier bins
       shifted = Int[]
       for b in bins
         f = (b - 1) <= N ÷ 2 ? (b - 1) : (b - 1 - N)           # FFT bin → signed cycle-frequency

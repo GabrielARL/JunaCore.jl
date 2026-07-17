@@ -80,9 +80,9 @@ function signallength end
 Declare the receiver-refinement objective implemented by `m`. The shared modem
 interface does not require refinement, so the default is `:none`. Implementations
 may return a more specific capability such as `:pilot_band_ls`,
-`:posterior_anchor_ls`, `:reduced_wz`, or `:coupled_cwz`; every non-`:none`
-declaration must have an executable contract test for the corresponding
-objective.
+`:posterior_anchor_ls`, `:reduced_wz`, `:coupled_cwz`, or
+`:frame_stateful_band_rls`; every non-`:none` declaration must have an
+executable contract test for the corresponding objective.
 """
 refinement_objective(::Modulation) = :none
 
