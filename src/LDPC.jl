@@ -12,6 +12,8 @@ module LDPC
 
 export create, build, generator, read_H
 
+const _MAX_TOOL_SEED = Int((typemax(Int32) - 1) ÷ 10)
+
 method_args(method, dc; no4cycle=true) =
   no4cycle ? [string(method), string(dc), "no4cycle"] : [string(method), string(dc)]
 
@@ -30,6 +32,8 @@ knob produces a fresh code instead of silently reusing a stale file.
 """
 function build(k, n; method="evenboth", dc=3, no4cycle=true, seed=1,
                dir=joinpath(tempdir(), "jldpc_cache"))
+  0 <= seed <= _MAX_TOOL_SEED || throw(ArgumentError(
+    "LDPC helper seed must be between 0 and $(_MAX_TOOL_SEED), got $(seed)"))
   mkpath(dir)
   margs = method_args(method, dc; no4cycle=no4cycle)
   tag = replace(join([k, n, seed, margs...], "_"), r"[^A-Za-z0-9_]" => "")
@@ -37,14 +41,14 @@ function build(k, n; method="evenboth", dc=3, no4cycle=true, seed=1,
   pchk, gen, htxt = base * ".pchk", base * ".gen", base * ".H"
 
   if !_ok(pchk)
-    _run(Cmd(vcat([_tool("make-ldpc"), pchk, string(n - k), string(n), string(seed)], margs)))
+    _run(_tool_command("make-ldpc", pchk, string(n - k), string(n), string(seed), margs...))
   end
   if !_ok(gen)
-    _run(Cmd([_tool("make-gen"), pchk, gen, "dense"]))
+    _run(_tool_command("make-gen", pchk, gen, "dense"))
   end
   if !_ok(htxt)
     open(htxt, "w") do io
-      run(pipeline(`$(_tool("print-pchk")) $pchk`; stdout=io, stderr=devnull))
+      _run(_tool_command("print-pchk", pchk); stdout=io)
     end
   end
 
@@ -118,7 +122,21 @@ function generator(filename)
   end
 end
 
-_run(cmd) = run(pipeline(cmd; stdout=devnull, stderr=devnull))
+function _run(cmd; stdout=devnull)
+  errors = IOBuffer()
+  try
+    run(pipeline(cmd; stdout, stderr=errors))
+  catch err
+    detail = strip(String(take!(errors)))
+    isempty(detail) && rethrow()
+    error("LDPC helper failed: $(detail)")
+  end
+end
+
+function _tool_command(name, args...)
+  tool = _tool(name)
+  Cmd(Cmd(String[tool, string.(args)...]); dir=dirname(tool))
+end
 
 function _tool(name)
   candidates = (

@@ -910,7 +910,15 @@ function _create_sparse_systematic_code(k::Int, n::Int, dc::Int, seed::Int,
         var_edges, invperm(icols))
 end
 
-_ldpc_seed(k, n, npc) = k * 1_000_000 + n * 1_000 + npc
+function _ldpc_seed(k, n, npc)
+  # Pin the paper-default graph to a reviewed range-safe seed while deriving
+  # distinct valid helper seeds for other code geometries.
+  mixed = Int128(10_001) +
+          (Int128(k) - 340) * 1_000_003 +
+          (Int128(n) - 1360) * 1_009 +
+          (Int128(npc) - 3)
+  Int(mod(mixed, Int128(LDPC._MAX_TOOL_SEED) + 1))
+end
 
 function _build_graph(H)
   mrows, n = size(H)
