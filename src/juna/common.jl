@@ -1388,7 +1388,9 @@ function _equalize_from_targets(m::Modulation, yparts, layout::_Layout, target_i
       pos = target_pos[k]
       pos == 0 || push!(local_targets, pos)
     end
-    if length(local_targets) < m.partial_fft_parts
+    # A merely square local fit is numerically fragile for high branch counts:
+    # use all pilots until the per-band system is at least 2x overdetermined.
+    if length(local_targets) < 2 * m.partial_fft_parts
       resize!(local_targets, length(target_idx))
       @inbounds for i in eachindex(target_idx)
         local_targets[i] = i
