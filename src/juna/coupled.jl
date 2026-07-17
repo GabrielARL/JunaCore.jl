@@ -54,6 +54,7 @@ struct _CoupledProblem
   spec::_CoupledSolverSpec
   observations::Matrix{ComplexF64}
   active::Vector{Int}
+  active_slots::Vector{Int}
   dc_index::Int
   pilot_idx::Vector{Int}
   pilot_syms::Vector{ComplexF64}
@@ -79,8 +80,11 @@ _coupled_combiner_groups(problem::_CoupledProblem) =
     length(problem.active) : length(problem.bands)
 
 function _coupled_active_slot(problem::_CoupledProblem, carrier::Integer)
-  slot = searchsortedfirst(problem.active, Int(carrier))
-  slot <= length(problem.active) && problem.active[slot] == carrier ||
+  k = Int(carrier)
+  1 <= k <= length(problem.active_slots) ||
+    throw(ArgumentError("carrier $carrier is not active in the coupled problem"))
+  slot = problem.active_slots[k]
+  slot > 0 ||
     throw(ArgumentError("carrier $carrier is not active in the coupled problem"))
   slot
 end
@@ -263,7 +267,6 @@ end
 
 function _coupled_indices(name::AbstractString, values, nc::Int)
   indices = Int[value for value in values]
-  issorted(indices) || throw(ArgumentError("$name must be sorted"))
   allunique(indices) || throw(ArgumentError("$name must not contain duplicates"))
   all(k -> 1 <= k <= nc, indices) ||
     throw(ArgumentError("$name contains a carrier outside 1:$nc"))
@@ -296,7 +299,7 @@ function _CoupledProblem(observations::AbstractMatrix{<:Number};
   data = _coupled_indices("data_idx", data_idx, nc)
   isempty(intersect(pilots, data)) ||
     throw(ArgumentError("pilot and data carriers must be disjoint"))
-  sort(vcat(pilots, data)) == active2 ||
+  sort(vcat(pilots, data)) == sort(active2) ||
     throw(ArgumentError("pilot and data carriers must partition the active set"))
 
   pilot_symbols = ComplexF64[symbol for symbol in pilot_syms]
@@ -327,6 +330,10 @@ function _CoupledProblem(observations::AbstractMatrix{<:Number};
 
   active_mask = falses(nc)
   active_mask[active2] .= true
+  active_slots = zeros(Int, nc)
+  for (slot, carrier) in enumerate(active2)
+    active_slots[carrier] = slot
+  end
   offsets = collect(_coupled_ici_offsets(spec))
   neighbor_idx = zeros(Int, length(offsets), nc)
   for k in active2, (offset_pos, offset) in enumerate(offsets)
@@ -364,6 +371,7 @@ function _CoupledProblem(observations::AbstractMatrix{<:Number};
     spec,
     Matrix{ComplexF64}(observations),
     active2,
+    active_slots,
     Int(dc_index),
     pilots,
     pilot_symbols,
